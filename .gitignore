@@ -1,4 +1,5 @@
 BatteryTray.exe
 probe.exe
 *.png
+!docs/tray.png
 dongle-task.xml
