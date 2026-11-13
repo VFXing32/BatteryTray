@@ -1,7 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -14,6 +15,8 @@ internal sealed class DeviceState
     public int? Percent;
     public bool Charging;
     public bool Online;
+    public bool Stale;
+    public DateTime Seen;
     public string Detail;
 }
 
@@ -771,18 +774,356 @@ internal static class Logitech
     }
 }
 
+internal struct SlotSnapshot
+{
+    public string Key;
+    public string Mark;
+    public bool Busy;
+    public DeviceState State;
+}
+
+internal sealed class TaskbarWidget : Form
+{
+    const int IconSize = 18;
+    const int TextGap = 5;
+    const int Gap = 14;
+    const int Pad = 8;
+    static readonly Color Offline = Color.FromArgb(140, 140, 140);
+    readonly List<View> views = new List<View>();
+    readonly Font font = new Font("Segoe UI Semibold", 12f, FontStyle.Regular, GraphicsUnit.Pixel);
+    readonly Font glyphs = IconFont(16f);
+    readonly System.Windows.Forms.Timer raise = new System.Windows.Forms.Timer();
+    readonly WinEventProc onForeground;
+    readonly Action open;
+    IntPtr hook;
+    bool hovering;
+
+    delegate void WinEventProc(IntPtr hook, uint evt, IntPtr hwnd, int obj, int child, uint thread, uint time);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr module, WinEventProc proc, uint process, uint thread, uint flags);
+
+    [DllImport("user32.dll")]
+    static extern bool UnhookWinEvent(IntPtr hook);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetDC(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+
+    [DllImport("gdi32.dll")]
+    static extern uint GetPixel(IntPtr dc, int x, int y);
+
+    sealed class View
+    {
+        public string Mark;
+        public DeviceState State;
+        public string Text;
+        public int Width;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    static extern IntPtr FindWindow(string cls, string name);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string name);
+
+    [DllImport("user32.dll")]
+    static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+    [DllImport("user32.dll")]
+    static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
+
+    public TaskbarWidget(Action open)
+    {
+        this.open = open;
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        TopMost = true;
+        Cursor = Cursors.Hand;
+        BackColor = Color.FromArgb(32, 32, 32);
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        onForeground = delegate { Raise(); };
+        raise.Interval = 250;
+        raise.Tick += delegate { Raise(); };
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            CreateParams parameters = base.CreateParams;
+            parameters.ExStyle |= 0x80 | 0x08;
+            return parameters;
+        }
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        hook = SetWinEventHook(0x0003, 0x0003, IntPtr.Zero, onForeground, 0, 0, 0);
+        raise.Start();
+    }
+
+    void Raise()
+    {
+        if (IsHandleCreated) SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+    }
+
+    public static StringFormat Format(StringAlignment alignment)
+    {
+        var format = new StringFormat(StringFormat.GenericTypographic);
+        format.Alignment = alignment;
+        format.LineAlignment = StringAlignment.Center;
+        format.FormatFlags |= StringFormatFlags.NoWrap;
+        return format;
+    }
+
+    public void UpdateDevices(List<SlotSnapshot> slots)
+    {
+        views.Clear();
+        foreach (SlotSnapshot slot in slots)
+        {
+            var view = new View();
+            view.Mark = slot.Mark;
+            view.State = slot.State;
+            view.Text = slot.State == null || slot.State.Percent == null ? null : slot.State.Percent.Value + "%";
+            view.Width = IconSize;
+            if (view.Text != null)
+            {
+                int textWidth = TextRenderer.MeasureText(view.Text, font, new Size(200, 40), TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width;
+                view.Width += TextGap + textWidth + (slot.State.Charging ? 9 : 0);
+            }
+            views.Add(view);
+        }
+        views.Sort(delegate(View a, View b) { return Rank(a.Mark).CompareTo(Rank(b.Mark)); });
+        PlaceOnTaskbar();
+        Render();
+    }
+
+    public static int Rank(string mark)
+    {
+        if (mark == "M") return 0;
+        if (mark == "K") return 1;
+        if (mark == "H") return 2;
+        return 3;
+    }
+
+    int ContentWidth()
+    {
+        int width = 0;
+        foreach (View view in views) width += view.Width + Gap;
+        if (width == 0) return IconSize;
+        return width - Gap;
+    }
+
+    void PlaceOnTaskbar()
+    {
+        int count = Math.Max(views.Count, 1);
+        int width = Pad * 2 + ContentWidth();
+        int height = 40;
+        RECT taskbar;
+        IntPtr bar = FindWindow("Shell_TrayWnd", null);
+        if (bar == IntPtr.Zero || !GetWindowRect(bar, out taskbar))
+        {
+            Rectangle work = Screen.PrimaryScreen.WorkingArea;
+            MoveWidget(work.Right - width - 12, work.Bottom - height - 8, width, height);
+            return;
+        }
+        int barWidth = taskbar.Right - taskbar.Left;
+        int barHeight = taskbar.Bottom - taskbar.Top;
+        bool horizontal = barWidth >= barHeight;
+        int x;
+        int y;
+        if (horizontal)
+        {
+            RECT tray;
+            IntPtr trayWindow = FindWindowEx(bar, IntPtr.Zero, "TrayNotifyWnd", null);
+            int anchor = trayWindow != IntPtr.Zero && GetWindowRect(trayWindow, out tray) ? tray.Left : taskbar.Right;
+            x = anchor - width - 8;
+            if (x < taskbar.Left + 60) x = taskbar.Left + 60;
+            y = taskbar.Top + Math.Max(0, (barHeight - height) / 2);
+        }
+        else
+        {
+            width = Pad * 2 + IconSize + 36;
+            height = Pad * 2 + count * 36 - 8;
+            x = taskbar.Left < 200 ? taskbar.Right + 8 : taskbar.Left - width - 8;
+            y = taskbar.Top + 8;
+        }
+        MoveWidget(x, y, width, height);
+    }
+
+    void MoveWidget(int x, int y, int width, int height)
+    {
+        if (!IsHandleCreated) return;
+        uint flags = 0x0010 | 0x0040;
+        if (Location.X == x && Location.Y == y && Width == width && Height == height) flags |= 0x0001 | 0x0002;
+        SetWindowPos(Handle, new IntPtr(-1), x, y, width, height, flags);
+    }
+
+    void Render()
+    {
+        if (!IsHandleCreated) return;
+        Color behind = TaskbarColor();
+        if (behind.ToArgb() != BackColor.ToArgb()) BackColor = behind;
+        Invalidate();
+    }
+
+    Color TaskbarColor()
+    {
+        IntPtr screen = GetDC(IntPtr.Zero);
+        uint pixel = GetPixel(screen, Left - 3, Top + Height / 2);
+        ReleaseDC(IntPtr.Zero, screen);
+        if (pixel == 0xFFFFFFFF) return BackColor;
+        return Color.FromArgb((int)(pixel & 0xFF), (int)(pixel >> 8 & 0xFF), (int)(pixel >> 16 & 0xFF));
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics graphics = e.Graphics;
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        graphics.Clear(BackColor);
+        if (hovering)
+        {
+            using (GraphicsPath path = Round(new RectangleF(1, 4, Width - 2, Height - 8), 5f))
+            using (SolidBrush brush = new SolidBrush(Color.FromArgb(26, 255, 255, 255)))
+                graphics.FillPath(brush, path);
+        }
+        int x = Pad;
+        foreach (View view in views)
+        {
+            Color color = view.Text == null ? Offline : GlyphColor(view.Mark);
+            const TextFormatFlags flags = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
+            TextRenderer.DrawText(graphics, Glyph(view.Mark), glyphs, new Rectangle(x, 0, IconSize, Height), color, flags | TextFormatFlags.HorizontalCenter);
+            if (view.Text != null)
+            {
+                bool low = view.State.Percent.Value <= 15 && !view.State.Charging;
+                var textBox = new Rectangle(x + IconSize + TextGap, 0, view.Width, Height);
+                TextRenderer.DrawText(graphics, view.Text, font, textBox, low ? Color.FromArgb(255, 96, 96) : Color.White, flags);
+                if (view.State.Charging)
+                    DrawBolt(graphics, x + view.Width - 8, Height / 2f, color);
+            }
+            x += view.Width + Gap;
+        }
+    }
+
+    public static Color GlyphColor(string mark)
+    {
+        if (mark == "H") return Color.FromArgb(68, 214, 44);
+        if (mark == "M") return Color.FromArgb(255, 140, 0);
+        return Color.FromArgb(0, 132, 255);
+    }
+
+    public static string Glyph(string mark)
+    {
+        if (mark == "M") return "\uE962";
+        if (mark == "H") return "\uE7F6";
+        return "\uE765";
+    }
+
+    public static Font IconFont(float size)
+    {
+        foreach (string family in new[] { "Segoe Fluent Icons", "Segoe MDL2 Assets" })
+        {
+            var candidate = new Font(family, size, FontStyle.Regular, GraphicsUnit.Pixel);
+            if (candidate.Name == family) return candidate;
+            candidate.Dispose();
+        }
+        return new Font("Segoe UI Symbol", size, FontStyle.Regular, GraphicsUnit.Pixel);
+    }
+
+    public static void DrawBolt(Graphics graphics, float x, float y, Color color)
+    {
+        PointF[] bolt = new PointF[]
+        {
+            new PointF(x + 5f, y - 6f),
+            new PointF(x + 1f, y + 0.5f),
+            new PointF(x + 4f, y + 0.5f),
+            new PointF(x + 2f, y + 6f),
+            new PointF(x + 7f, y - 0.5f),
+            new PointF(x + 4f, y - 0.5f)
+        };
+        using (SolidBrush brush = new SolidBrush(color))
+            graphics.FillPolygon(brush, bolt);
+    }
+
+    public static GraphicsPath Round(RectangleF box, float radius)
+    {
+        float diameter = Math.Min(radius * 2f, Math.Min(box.Width, box.Height));
+        var path = new GraphicsPath();
+        if (diameter <= 1f)
+        {
+            path.AddRectangle(box);
+            return path;
+        }
+        path.AddArc(box.X, box.Y, diameter, diameter, 180f, 90f);
+        path.AddArc(box.Right - diameter, box.Y, diameter, diameter, 270f, 90f);
+        path.AddArc(box.Right - diameter, box.Bottom - diameter, diameter, diameter, 0f, 90f);
+        path.AddArc(box.X, box.Bottom - diameter, diameter, diameter, 90f, 90f);
+        path.CloseFigure();
+        return path;
+    }
+
+    protected override void OnMouseEnter(EventArgs e)
+    {
+        hovering = true;
+        Render();
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        hovering = false;
+        Render();
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right) open();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            if (hook != IntPtr.Zero) UnhookWinEvent(hook);
+            raise.Dispose();
+            font.Dispose();
+            glyphs.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+}
+
 internal sealed class TrayApp : ApplicationContext
 {
     const string RunName = "BatteryTray";
-    const int MouseQuietSeconds = 15 * 60;
+    const int MouseQuietSeconds = 90;
     const int KeyboardQuietSeconds = 10 * 60;
     const int HeadphoneQuietSeconds = 30 * 60;
+    const int WakeSeconds = 15;
     readonly List<Slot> slots = new List<Slot>();
     readonly System.Windows.Forms.Timer timer;
     readonly object gate = new object();
     readonly Dictionary<string, bool> warned = new Dictionary<string, bool>();
+    readonly TaskbarWidget widget;
+    readonly Flyout flyout;
+    readonly NotifyIcon alerts;
     List<ExtraDevice> pending;
     Thread worker;
+    int alertLeft;
     volatile bool running = true;
 
     sealed class Slot
@@ -791,18 +1132,24 @@ internal sealed class TrayApp : ApplicationContext
         public string Mark;
         public int Quiet;
         public Func<DeviceState> Read;
-        public NotifyIcon Icon;
-        public IntPtr Handle;
         public DeviceState State;
         public int Left;
+        public bool Busy;
     }
 
     public TrayApp()
     {
+        alerts = new NotifyIcon();
+        alerts.Icon = SystemIcons.Information;
+        alerts.Visible = false;
+        flyout = new Flyout(this);
+        widget = new TaskbarWidget(delegate { flyout.Toggle(widget.Bounds); });
+        widget.FormClosed += delegate { if (running) ExitThread(); };
         AddSlot("keyboard", "K", KeyboardQuietSeconds, Readers.Keyboard, "Keyboard");
         AddSlot("mouse", "M", MouseQuietSeconds, Readers.Mouse, "Mouse");
         AddSlot("headphones", "H", HeadphoneQuietSeconds, Readers.Headphones, "Headphones");
-        ApplyIcons();
+        widget.Show();
+        widget.UpdateDevices(Snapshot());
         Thread setup = new Thread(DongleRecover.Startup);
         setup.IsBackground = true;
         setup.Start();
@@ -814,7 +1161,8 @@ internal sealed class TrayApp : ApplicationContext
         timer.Tick += delegate
         {
             AdoptPending();
-            ApplyIcons();
+            widget.UpdateDevices(Snapshot());
+            if (alertLeft > 0 && --alertLeft == 0) alerts.Visible = false;
         };
         timer.Start();
     }
@@ -827,18 +1175,83 @@ internal sealed class TrayApp : ApplicationContext
         slot.Quiet = quiet;
         slot.Read = read;
         slot.State = Blank(name);
-        slot.Icon = MakeIcon(name);
         slots.Add(slot);
     }
 
-    NotifyIcon MakeIcon(string name)
+    internal List<SlotSnapshot> Snapshot()
     {
-        var icon = new NotifyIcon();
-        icon.Visible = true;
-        icon.Text = name;
-        icon.ContextMenuStrip = BuildMenu();
-        icon.MouseUp += OnMouseUp;
-        return icon;
+        var list = new List<SlotSnapshot>();
+        lock (gate)
+        {
+            foreach (Slot slot in slots)
+            {
+                var item = new SlotSnapshot();
+                item.Key = slot.Key;
+                item.Mark = slot.Mark;
+                item.Busy = slot.Busy;
+                item.State = slot.State;
+                list.Add(item);
+            }
+        }
+        list.Sort(delegate(SlotSnapshot a, SlotSnapshot b) { return TaskbarWidget.Rank(a.Mark).CompareTo(TaskbarWidget.Rank(b.Mark)); });
+        return list;
+    }
+
+    internal void RefreshDevice(string key)
+    {
+        Slot target = null;
+        lock (gate)
+        {
+            foreach (Slot slot in slots)
+            {
+                if (slot.Key == key) target = slot;
+            }
+        }
+        if (target != null) ThreadPool.QueueUserWorkItem(delegate { ReadSlot(target); });
+    }
+
+    internal void RefreshAll()
+    {
+        List<Slot> copy;
+        lock (gate) { copy = new List<Slot>(slots); }
+        foreach (Slot slot in copy)
+        {
+            Slot target = slot;
+            ThreadPool.QueueUserWorkItem(delegate { ReadSlot(target); });
+        }
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            Catalog.ForgetLogitech();
+            List<ExtraDevice> found = Catalog.Discover();
+            lock (gate) { pending = found; }
+        });
+    }
+
+    internal void ReconnectReceiver()
+    {
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            DongleRecover.Recover(true);
+            RefreshDevice("headphones");
+        });
+    }
+
+    void ReadSlot(Slot slot)
+    {
+        lock (gate)
+        {
+            if (slot.Busy) return;
+            slot.Busy = true;
+        }
+        try
+        {
+            Apply(slot, Safe(slot.Read));
+            NotifyLow(slot);
+        }
+        finally
+        {
+            lock (gate) { slot.Busy = false; }
+        }
     }
 
     static DeviceState Blank(string name)
@@ -865,15 +1278,9 @@ internal sealed class TrayApp : ApplicationContext
                         continue;
                     }
                     due.Add(slot);
-                    slot.Left = slot.Quiet;
                 }
             }
-            foreach (Slot slot in due)
-            {
-                DeviceState next = Safe(slot.Read);
-                lock (gate) { slot.State = KeepLast(slot.State, next); }
-                NotifyLow(slot);
-            }
+            foreach (Slot slot in due) ReadSlot(slot);
             if (!running) break;
             Thread.Sleep(1000);
         }
@@ -902,7 +1309,6 @@ internal sealed class TrayApp : ApplicationContext
             added.Quiet = extra.QuietSeconds;
             added.Read = extra.Read;
             added.State = Blank(extra.Name);
-            added.Icon = MakeIcon(extra.Name);
             lock (gate) { slots.Add(added); }
         }
     }
@@ -918,14 +1324,26 @@ internal sealed class TrayApp : ApplicationContext
         }
     }
 
+    void Apply(Slot slot, DeviceState next)
+    {
+        bool fresh = next.Percent != null;
+        if (fresh) next.Seen = DateTime.Now;
+        lock (gate)
+        {
+            slot.State = KeepLast(slot.State, next);
+            slot.Left = fresh ? slot.Quiet : WakeSeconds;
+        }
+    }
+
     static DeviceState KeepLast(DeviceState previous, DeviceState next)
     {
         if (next.Percent == null && previous != null && previous.Percent != null && next.Online)
         {
             next.Percent = previous.Percent;
             next.Charging = previous.Charging;
-            if (next.Detail == null || next.Detail.StartsWith("asleep") || next.Detail.StartsWith("no report"))
-                next.Detail = previous.Detail + ", last reading";
+            next.Stale = true;
+            next.Seen = previous.Seen;
+            next.Detail = previous.Detail;
         }
         if (string.IsNullOrEmpty(next.Name) && previous != null) next.Name = previous.Name;
         return next;
@@ -942,45 +1360,19 @@ internal sealed class TrayApp : ApplicationContext
         {
             lock (gate) { warned[slot.Key] = true; }
             string text = state.Name + " is at " + state.Percent.Value + "%";
-            try { if (slot.Icon != null) slot.Icon.ShowBalloonTip(4000, "Low battery", text, ToolTipIcon.Warning); }
+            try
+            {
+                string message = text;
+                widget.BeginInvoke(new Action(delegate
+                {
+                    alerts.Visible = true;
+                    alerts.ShowBalloonTip(4000, "Low battery", message, ToolTipIcon.Warning);
+                    alertLeft = 8;
+                }));
+            }
             catch (Exception) { }
         }
         if (!low) lock (gate) { warned[slot.Key] = false; }
-    }
-
-    void ApplyIcons()
-    {
-        List<Slot> copy;
-        lock (gate) { copy = new List<Slot>(slots); }
-        foreach (Slot slot in copy)
-            slot.Handle = Paint(slot.Icon, slot.State, slot.Mark, slot.Handle);
-    }
-
-    static IntPtr Paint(NotifyIcon tray, DeviceState state, string mark, IntPtr previousHandle)
-    {
-        string tip = Line(state);
-        if (tip.Length > 63) tip = tip.Substring(0, 63);
-        tray.Text = tip;
-        IntPtr created;
-        Icon icon = Draw(state.Percent, mark, out created);
-        Icon previous = tray.Icon;
-        tray.Icon = icon;
-        if (previous != null) previous.Dispose();
-        if (previousHandle != IntPtr.Zero) DestroyIcon(previousHandle);
-        ContextMenuStrip menu = tray.ContextMenuStrip;
-        if (menu != null && menu.Items.Count > 0)
-            menu.Items[0].Text = Line(state);
-        return created;
-    }
-
-    [DllImport("user32.dll", SetLastError = true)]
-    static extern bool DestroyIcon(IntPtr handle);
-
-    static string Line(DeviceState state)
-    {
-        string level = state.Percent == null ? "—" : state.Percent.Value + "%" + (state.Charging ? " charging" : "");
-        string detail = string.IsNullOrEmpty(state.Detail) ? "" : "  " + state.Detail;
-        return state.Name + "   " + level + detail;
     }
 
     static Icon Draw(int? percent, string mark, out IntPtr handle)
@@ -1081,62 +1473,13 @@ internal sealed class TrayApp : ApplicationContext
             ring.Y + ring.Height / 2f + ring.Height / 2f * (float)Math.Sin(radians));
     }
 
-    ContextMenuStrip BuildMenu()
-    {
-        var menu = new ContextMenuStrip();
-        menu.Items.Add("Checking…").Enabled = false;
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Refresh now", null, delegate { ThreadPool.QueueUserWorkItem(delegate { RefreshNow(); }); });
-        menu.Items.Add("Reconnect Razer receiver", null, delegate { ThreadPool.QueueUserWorkItem(delegate { DongleRecover.Recover(true); }); });
-        var startup = new ToolStripMenuItem("Start with Windows");
-        startup.Checked = IsStartup();
-        startup.Click += delegate
-        {
-            startup.Checked = !startup.Checked;
-            SetStartup(startup.Checked);
-        };
-        menu.Items.Add(startup);
-        menu.Items.Add("Exit", null, delegate { ExitThread(); });
-        return menu;
-    }
-
-    void RefreshNow()
-    {
-        List<Slot> copy;
-        lock (gate) { copy = new List<Slot>(slots); }
-        foreach (Slot slot in copy)
-        {
-            DeviceState next = Safe(slot.Read);
-            lock (gate)
-            {
-                slot.State = KeepLast(slot.State, next);
-                slot.Left = slot.Quiet;
-            }
-        }
-        Catalog.ForgetLogitech();
-        lock (gate) { pending = Catalog.Discover(); }
-    }
-
-    void OnMouseUp(object sender, MouseEventArgs e)
-    {
-        if (e.Button != MouseButtons.Left) return;
-        NotifyIcon icon = sender as NotifyIcon;
-        if (icon != null) MethodInfoShow(icon.ContextMenuStrip);
-    }
-
-    static void MethodInfoShow(ContextMenuStrip menu)
-    {
-        if (menu == null) return;
-        menu.Show(Cursor.Position);
-    }
-
-    static bool IsStartup()
+    internal static bool IsStartup()
     {
         using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", false))
             return key != null && key.GetValue(RunName) != null;
     }
 
-    static void SetStartup(bool enabled)
+    internal static void SetStartup(bool enabled)
     {
         using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
         {
@@ -1150,16 +1493,368 @@ internal sealed class TrayApp : ApplicationContext
     {
         running = false;
         timer.Stop();
-        foreach (Slot slot in slots)
-            CloseIcon(slot.Icon, slot.Handle);
+        alerts.Visible = false;
+        alerts.Dispose();
+        flyout.Dispose();
+        widget.Dispose();
         base.ExitThreadCore();
     }
+}
 
-    static void CloseIcon(NotifyIcon icon, IntPtr handle)
+internal sealed class Flyout : Form
+{
+    const int PanelWidth = 340;
+    const int HeaderHeight = 52;
+    const int RowHeight = 64;
+    const int ItemHeight = 40;
+    const int Button = 32;
+    const string RefreshGlyph = "\uE72C";
+    static readonly Color Back = Color.FromArgb(36, 36, 36);
+    static readonly Color Card = Color.FromArgb(46, 46, 46);
+    static readonly Color Hot = Color.FromArgb(60, 60, 60);
+    static readonly Color Line = Color.FromArgb(62, 62, 62);
+    static readonly Color Ink = Color.FromArgb(242, 242, 242);
+    static readonly Color Muted = Color.FromArgb(160, 160, 160);
+    static readonly Color Dim = Color.FromArgb(120, 120, 120);
+    static readonly Color Accent = Color.FromArgb(76, 194, 255);
+    static readonly Color Low = Color.FromArgb(255, 99, 99);
+    const TextFormatFlags LeftText = TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis;
+    const TextFormatFlags CenterText = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
+    readonly TrayApp app;
+    readonly Font title = new Font("Segoe UI Semibold", 15f, FontStyle.Regular, GraphicsUnit.Pixel);
+    readonly Font name = new Font("Segoe UI Semibold", 13f, FontStyle.Regular, GraphicsUnit.Pixel);
+    readonly Font small = new Font("Segoe UI", 12f, FontStyle.Regular, GraphicsUnit.Pixel);
+    readonly Font level = new Font("Segoe UI Semibold", 16f, FontStyle.Regular, GraphicsUnit.Pixel);
+    readonly Font body = new Font("Segoe UI", 13f, FontStyle.Regular, GraphicsUnit.Pixel);
+    readonly Font deviceIcons = TaskbarWidget.IconFont(22f);
+    readonly Font icons = TaskbarWidget.IconFont(15f);
+    readonly StringFormat centered = TaskbarWidget.Format(StringAlignment.Center);
+    readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer();
+    readonly List<Hit> hits = new List<Hit>();
+    List<SlotSnapshot> devices = new List<SlotSnapshot>();
+    string hover;
+    float spin;
+    bool startup;
+    DateTime hiddenAt;
+
+    sealed class Hit
     {
-        icon.Visible = false;
-        icon.Dispose();
-        if (handle != IntPtr.Zero) DestroyIcon(handle);
+        public string Id;
+        public Rectangle Box;
+        public Action Run;
+    }
+
+    [DllImport("dwmapi.dll")]
+    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+    public Flyout(TrayApp app)
+    {
+        this.app = app;
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        TopMost = true;
+        KeyPreview = true;
+        BackColor = Back;
+        Width = PanelWidth;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        tick.Interval = 40;
+        int frame = 0;
+        tick.Tick += delegate
+        {
+            frame++;
+            bool busy = false;
+            foreach (SlotSnapshot device in app.Snapshot()) busy |= device.Busy;
+            if (busy) spin = (spin + 24f) % 360f;
+            else spin = 0f;
+            if (busy || frame % 25 == 0) Reload();
+        };
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            CreateParams parameters = base.CreateParams;
+            parameters.ExStyle |= 0x80;
+            return parameters;
+        }
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        int round = 2;
+        int border = Line.R | Line.G << 8 | Line.B << 16;
+        DwmSetWindowAttribute(Handle, 33, ref round, 4);
+        DwmSetWindowAttribute(Handle, 34, ref border, 4);
+    }
+
+    public void Toggle(Rectangle anchor)
+    {
+        if (Visible)
+        {
+            Hide();
+            return;
+        }
+        if ((DateTime.Now - hiddenAt).TotalMilliseconds < 300) return;
+        startup = TrayApp.IsStartup();
+        hover = null;
+        Reload();
+        Rectangle work = Screen.FromRectangle(anchor).WorkingArea;
+        int x = Math.Max(work.Left + 12, Math.Min(anchor.Right - Width, work.Right - Width - 12));
+        int y = anchor.Top >= work.Bottom - 4 ? work.Bottom - Height - 12 : work.Top + 12;
+        Location = new Point(x, y);
+        Show();
+        Activate();
+        tick.Start();
+    }
+
+    protected override void OnDeactivate(EventArgs e)
+    {
+        base.OnDeactivate(e);
+        tick.Stop();
+        hiddenAt = DateTime.Now;
+        Hide();
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Escape) Hide();
+    }
+
+    void Reload()
+    {
+        devices = app.Snapshot();
+        hits.Clear();
+        Add("all", new Rectangle(PanelWidth - 16 - Button, (HeaderHeight - Button) / 2, Button, Button), app.RefreshAll);
+        int y = HeaderHeight;
+        foreach (SlotSnapshot device in devices)
+        {
+            string key = device.Key;
+            int buttonY = y + (RowHeight - 6 - Button) / 2;
+            Add("device:" + key, new Rectangle(22, buttonY, Button, Button), delegate { app.RefreshDevice(key); });
+            y += RowHeight;
+        }
+        y += 9;
+        Add("reconnect", new Rectangle(6, y, PanelWidth - 12, ItemHeight), app.ReconnectReceiver);
+        y += ItemHeight;
+        Add("startup", new Rectangle(6, y, PanelWidth - 12, ItemHeight), delegate
+        {
+            startup = !startup;
+            TrayApp.SetStartup(startup);
+        });
+        y += ItemHeight;
+        Add("exit", new Rectangle(6, y, PanelWidth - 12, ItemHeight), app.ExitThread);
+        y += ItemHeight + 6;
+        if (Height != y) Height = y;
+        Invalidate();
+    }
+
+    void Add(string id, Rectangle box, Action run)
+    {
+        var hit = new Hit();
+        hit.Id = id;
+        hit.Box = box;
+        hit.Run = run;
+        hits.Add(hit);
+    }
+
+    Hit Find(string id)
+    {
+        foreach (Hit hit in hits)
+        {
+            if (hit.Id == id) return hit;
+        }
+        return null;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics graphics = e.Graphics;
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+        graphics.Clear(Back);
+        bool anyBusy = false;
+        foreach (SlotSnapshot device in devices) anyBusy |= device.Busy;
+
+        TextRenderer.DrawText(graphics, "Battery", title, new Rectangle(18, 2, 200, HeaderHeight), Ink, LeftText);
+        DrawIconButton(graphics, Find("all"), anyBusy);
+
+        int y = HeaderHeight;
+        foreach (SlotSnapshot device in devices)
+        {
+            DrawDevice(graphics, device, new Rectangle(12, y, PanelWidth - 24, RowHeight - 6));
+            y += RowHeight;
+        }
+
+        using (Pen pen = new Pen(Line))
+            graphics.DrawLine(pen, 0, y + 4, PanelWidth, y + 4);
+
+        DrawItem(graphics, Find("reconnect"), "\uE88E", "Reconnect Razer receiver");
+        Hit start = Find("startup");
+        DrawItem(graphics, start, "\uE7E8", "Start with Windows");
+        DrawSwitch(graphics, new Rectangle(start.Box.Right - 52, start.Box.Y + (start.Box.Height - 20) / 2, 40, 20), startup);
+        DrawItem(graphics, Find("exit"), "\uE8BB", "Exit");
+    }
+
+    void DrawDevice(Graphics graphics, SlotSnapshot device, Rectangle row)
+    {
+        DeviceState state = device.State;
+        bool online = state.Percent != null;
+        using (GraphicsPath path = TaskbarWidget.Round(row, 6f))
+        using (SolidBrush brush = new SolidBrush(Card))
+            graphics.FillPath(brush, path);
+
+        Hit button = Find("device:" + device.Key);
+        DrawIconButton(graphics, button, device.Busy);
+
+        Color tint = online ? TaskbarWidget.GlyphColor(device.Mark) : Dim;
+        int iconX = button.Box.Right + 4;
+        TextRenderer.DrawText(graphics, TaskbarWidget.Glyph(device.Mark), deviceIcons, new Rectangle(iconX, row.Y, 30, row.Height), tint, CenterText);
+
+        int textLeft = iconX + 34;
+        int percentRight = row.Right - 12;
+        string percent = online ? state.Percent.Value + "%" : "";
+        int percentWidth = online ? TextRenderer.MeasureText(percent, level, new Size(100, 40), LeftText).Width : 0;
+        int textWidth = percentRight - percentWidth - 8 - textLeft;
+
+        TextRenderer.DrawText(graphics, state.Name ?? device.Key, name, new Rectangle(textLeft, row.Y + 11, textWidth, 18), Ink, LeftText);
+        TextRenderer.DrawText(graphics, Subtitle(state, device.Busy), small, new Rectangle(textLeft, row.Y + 31, textWidth, 16), Muted, LeftText);
+
+        if (online)
+        {
+            bool low = state.Percent.Value <= 15 && !state.Charging;
+            var box = new Rectangle(percentRight - percentWidth, row.Y, percentWidth, row.Height);
+            TextRenderer.DrawText(graphics, percent, level, box, low ? Low : Ink, LeftText);
+            if (state.Charging) TaskbarWidget.DrawBolt(graphics, box.Left - 11, row.Y + row.Height / 2f, Accent);
+        }
+    }
+
+    void DrawIconButton(Graphics graphics, Hit hit, bool busy)
+    {
+        using (GraphicsPath path = TaskbarWidget.Round(hit.Box, hit.Box.Width / 2f))
+        using (SolidBrush brush = new SolidBrush(hover == hit.Id ? Color.FromArgb(78, 78, 78) : Color.FromArgb(58, 58, 58)))
+            graphics.FillPath(brush, path);
+        if (!busy)
+        {
+            TextRenderer.DrawText(graphics, RefreshGlyph, icons, hit.Box, Ink, CenterText);
+            return;
+        }
+        GraphicsState saved = graphics.Save();
+        graphics.TranslateTransform(hit.Box.X + hit.Box.Width / 2f, hit.Box.Y + hit.Box.Height / 2f);
+        graphics.RotateTransform(spin);
+        using (SolidBrush brush = new SolidBrush(Accent))
+            graphics.DrawString(RefreshGlyph, icons, brush, new RectangleF(-Button / 2f, -Button / 2f, Button, Button), centered);
+        graphics.Restore(saved);
+    }
+
+    void DrawItem(Graphics graphics, Hit hit, string glyph, string label)
+    {
+        if (hover == hit.Id)
+        {
+            using (GraphicsPath path = TaskbarWidget.Round(hit.Box, 5f))
+            using (SolidBrush brush = new SolidBrush(Hot))
+                graphics.FillPath(brush, path);
+        }
+        TextRenderer.DrawText(graphics, glyph, icons, new Rectangle(hit.Box.X + 10, hit.Box.Y, 24, hit.Box.Height), Ink, CenterText);
+        TextRenderer.DrawText(graphics, label, body, new Rectangle(hit.Box.X + 46, hit.Box.Y, hit.Box.Width - 110, hit.Box.Height), Ink, LeftText);
+    }
+
+    static void DrawSwitch(Graphics graphics, Rectangle box, bool on)
+    {
+        using (GraphicsPath track = TaskbarWidget.Round(box, box.Height / 2f))
+        {
+            if (on)
+            {
+                using (SolidBrush brush = new SolidBrush(Accent))
+                    graphics.FillPath(brush, track);
+            }
+            else
+            {
+                using (Pen pen = new Pen(Muted, 1f))
+                    graphics.DrawPath(pen, track);
+            }
+        }
+        float knob = on ? 12f : 10f;
+        float cx = on ? box.Right - box.Height / 2f : box.Left + box.Height / 2f;
+        float cy = box.Top + box.Height / 2f;
+        using (SolidBrush brush = new SolidBrush(on ? Color.Black : Muted))
+            graphics.FillEllipse(brush, cx - knob / 2f, cy - knob / 2f, knob, knob);
+    }
+
+    static string Subtitle(DeviceState state, bool busy)
+    {
+        if (busy) return "Checking…";
+        if (state.Percent == null)
+        {
+            string detail = state.Detail;
+            if (string.IsNullOrEmpty(detail)) return "Not connected";
+            if (detail.StartsWith("checking")) return "Checking…";
+            return char.ToUpper(detail[0]) + detail.Substring(1);
+        }
+        if (state.Charging) return "Charging";
+        if (state.Stale) return "Asleep · updated " + Ago(state.Seen);
+        return "Updated " + Ago(state.Seen);
+    }
+
+    static string Ago(DateTime when)
+    {
+        if (when == default(DateTime)) return "earlier";
+        TimeSpan age = DateTime.Now - when;
+        if (age.TotalSeconds < 60) return "just now";
+        if (age.TotalMinutes < 60) return (int)age.TotalMinutes + " min ago";
+        return (int)age.TotalHours + " h ago";
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        string found = null;
+        foreach (Hit hit in hits)
+        {
+            if (hit.Box.Contains(e.Location)) found = hit.Id;
+        }
+        Cursor = found == null ? Cursors.Default : Cursors.Hand;
+        if (found == hover) return;
+        hover = found;
+        Invalidate();
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        hover = null;
+        Invalidate();
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        foreach (Hit hit in hits)
+        {
+            if (!hit.Box.Contains(e.Location)) continue;
+            if (hit.Id == "exit") Hide();
+            hit.Run();
+            Reload();
+            return;
+        }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            tick.Dispose();
+            title.Dispose();
+            name.Dispose();
+            small.Dispose();
+            level.Dispose();
+            body.Dispose();
+            deviceIcons.Dispose();
+            icons.Dispose();
+            centered.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }
 
@@ -1466,6 +2161,9 @@ internal static class DongleRecover
 
 internal static class Program
 {
+    [DllImport("user32.dll", EntryPoint = "SetProcessDPIAware")]
+    static extern bool SetProcessDpiAware();
+
     [STAThread]
     static void Main(string[] args)
     {
@@ -1488,6 +2186,7 @@ internal static class Program
                 Print(extra.Read());
             return;
         }
+        SetProcessDpiAware();
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new TrayApp());
